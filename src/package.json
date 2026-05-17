@@ -1,0 +1,19 @@
+{
+  "name": "scale-space-synth",
+  "version": "0.1.0",
+  "description": "Scale Space Synthesist — a phase-space visualizer / higher-dimensional oscilloscope. WebGPU + TSL.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "three": "^0.183.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0",
+    "vite-plugin-singlefile": "^2.0.3"
+  }
+}
