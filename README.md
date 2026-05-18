@@ -62,7 +62,7 @@ Original ask: editable by a designer, not just a developer. One file = no jumpin
 
 ## Contributing
 
-PRs welcome. Discussion and shared waypoints at [/r/ScaleSpace](https://reddit.com/r/ScaleSpace).
+Thoughtful PRs welcome. Discussion and shared waypoints at [/r/ScaleSpace](https://reddit.com/r/ScaleSpace).
 
 ## License
 
