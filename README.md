@@ -64,11 +64,6 @@ Original ask: editable by a designer, not just a developer. One file = no jumpin
 
 All screenshots are unedited. Differences in scanlines and backgrounds come from settings in Scale Space Synthesist.
 
-<img src="img/Screenshot 2026-05-07 221114.png" width="100%" />
-<img src="img/Screenshot 2026-05-07 221200.png" width="100%" />
-<img src="img/Screenshot 2026-05-07 221501.png" width="100%" />
-<img src="img/Screenshot 2026-05-07 221521.png" width="100%" />
-
 <img src="img/Screenshot 2026-05-09 073620.png" width="100%" />
 <img src="img/Screenshot 2026-05-09 073933.png" width="100%" />
 <img src="img/Screenshot 2026-05-09 074014.png" width="100%" />
