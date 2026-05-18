@@ -1,3 +1,5 @@
+<img src="img/synthesistlogo.png" alt="Scale Space Synthesis" width="1024px" align="center" />
+
 # Scale Space Synthesist
 
 A WebGPU phase-space visualizer / particle-based morphoscope. Part of the [Scale Space](https://reddit.com/r/ScaleSpace) project.
