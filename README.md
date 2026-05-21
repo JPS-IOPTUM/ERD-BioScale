@@ -72,6 +72,8 @@ dist/          generated standalone build
 
 * [Video demo- How to use Panels](https://www.reddit.com/r/ScaleSpace/comments/1svvcox/scale_space_bioclast_alpha_01_release_notes/)
 * [Video demo- How to use Radials](https://www.reddit.com/r/ScaleSpace/comments/1t2sugd/scale_space_bioclast_alpha_02_release_notes/)
+* [Video tour through Scale Space](https://www.reddit.com/r/ScaleSpace/comments/1t4hz9i/heres_my_most_recent_tour_through_scale_space/)
+* [Two hours of exploration in Scale Space](https://www.reddit.com/r/ScaleSpace/comments/1szztpr/heres_the_full_2_hour_long_emergent_cellular/)
 
 # Screenshots
 
