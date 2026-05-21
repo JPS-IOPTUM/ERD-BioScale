@@ -81,8 +81,6 @@ To ensure absolute clarity regarding the authorship of this project:
 
 The division of labor across these models highlights a distinct reality of modern software development: AI did not build Scale Space Synthesist. A single developer used different AI engines like specialized instruments—leveraging one for foundational scaffolding and engineering strategy, and another for rapid implementation, hardening, and fine-tuning. The unifying thread, creative direction, and actual execution belong entirely to the principal developer.
 
-You're right – that was an overstatement. I’ve revised Part 3 to remove “last” and instead acknowledge the parallel collaboration with multiple models.
-
 ---
 
 # Part 3: DeepSeek (深度求索)
