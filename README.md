@@ -4,7 +4,7 @@
 
 ![status](https://img.shields.io/badge/status-1.0-green) ![license](https://img.shields.io/badge/license-MIT-blue)
 
-A WebGPU phase-space visualizer / particle-based morphoscope.<br />
+A Free, Open Source WebGPU phase-space visualizer / particle-based morphoscope.<br />
 Part of the [Scale Space](https://reddit.com/r/ScaleSpace) project.
 
 <img src="img/Scale-Space-Synthesist-v1.0-Screenshot.png" alt="Scale Space Synthesis" width="1024px" align="center" />
