@@ -13,6 +13,8 @@ Part of the [Scale Space](https://reddit.com/r/ScaleSpace) project.
 
 ## Just run it
 
+[Download the latest build here.](https://github.com/setzstone/ScaleSpaceSynth/releases)
+
 Open `dist/index.html` in a WebGPU-capable browser (Chrome / Edge / Brave / Safari 17.4+). Done. No install required.
 
 ## Edit it (any OS, no command line)
