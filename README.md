@@ -13,7 +13,9 @@ Part of the [Scale Space](https://reddit.com/r/ScaleSpace) project.
 
 ## Just run it
 
-[Download the latest build here](https://github.com/setzstone/ScaleSpaceSynth/releases) | [Get it on itch.io](https://setzstone.itch.io/scale-space) (early access to new features)
+[Play in the browser here](https://github.com/setzstone/ScaleSpaceSynth/releases). No account needed, 100% free.
+
+[Get it on itch.io](https://setzstone.itch.io/scale-space) (early access to new features)
 
 Open `dist/index.html` in a WebGPU-capable browser (Chrome / Edge / Brave / Safari 17.4+). No install required.
 
