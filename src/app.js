@@ -83,6 +83,7 @@ import {
     dot, length, normalize, sub, add, mul, sin, cos, fract, floor,
     compute, storage, Fn, time, max, min, div, mx_noise_float, step,
     atomicAdd, atomicStore, uint, int, mod, If, bitAnd, Loop, select, clamp, abs,
+    sqrt, pow,
     instancedBufferAttribute, modelViewMatrix, cameraProjectionMatrix, vertexIndex, billboarding, uv, cross
 } from 'three/tsl';
 
@@ -118,7 +119,7 @@ export const APP_TEXT = {
         "colorRange": { "label": "Color Spectrum Range", "sub": "", "ll": "tight", "lr": "wide" },
         "saturation": { "label": "Color Saturation", "sub": "", "ll": "muted", "lr": "vivid" },
         "variance": { "label": "Variance", "sub": "noise gradient", "ll": "uniform", "lr": "spectral" },
-        "opacity": { "label": "Particle Opacity", "sub": "", "ll": "ghost", "lr": "solid" },
+        "opacity": { "label": "System Opacity", "sub": "", "ll": "ghost", "lr": "solid" },
         "trailLength": { "label": "Trail Length", "sub": "", "ll": "short", "lr": "long" },
         "backdropOpacity": { "label": "Backdrop Opacity", "sub": "", "ll": "off", "lr": "bright" },
         "backdropBlur": { "label": "Backdrop Blur", "sub": "", "ll": "crisp", "lr": "soft" },
@@ -137,7 +138,7 @@ export const APP_TEXT = {
     },
     "colorMode": {
         "label": "Color Mode",
-        "items": ["White", "Size", "Velocity", "Density"]
+        "items": ["Mono", "Size", "Velocity", "Density"]
     },
     "moveMode": {
         "label": "Move Mode",
@@ -567,6 +568,12 @@ export async function captureWaypoint() {
     // is reconstructed via paintBackgroundLayer below since the bgGlow DIV
     // can't be drawImage'd.
 
+    // Hide developer-only overlays (reference grid) during capture so they
+    // don't appear in saved thumbnails or full-res screenshots. The flag is
+    // read by updateReferenceGrid each frame; we hold it across two rAFs to
+    // guarantee a clean frame is drawn before we sample the canvas, then
+    // clear it after both the thumb and full-res capture have read pixels.
+    window._captureInProgress = true;
     if (engine.render) await engine.render();
     await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
     
@@ -588,6 +595,10 @@ export async function captureWaypoint() {
     const thumb = tc.toDataURL('image/png');
 
     if (window.S.saveOnNewWaypoint) downloadFullResScreenshot(engine);
+
+    // Capture complete — clear the flag so the reference grid restores
+    // on the next frame.
+    window._captureInProgress = false;
 
     const flash = document.createElement('div');
     flash.className = 'flash';
@@ -698,6 +709,8 @@ export async function captureThumbnailFor(wpId) {
 
     const canvas = engine.canvas;
     // bgCanvas removed — see captureWaypoint above for rationale.
+    // Hide developer overlays during capture (matches captureWaypoint).
+    window._captureInProgress = true;
     if (engine.render) await engine.render();
     await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
 
@@ -722,6 +735,8 @@ export async function captureThumbnailFor(wpId) {
     // gets a screenshot for recaptures only if "Save On New Thumbnail" is on.
     // Lets people opt into one-or-both flows without conflating them.
     if (window.S.saveOnNewThumbnail) downloadFullResScreenshot(engine);
+
+    window._captureInProgress = false;
 
     // Reuse the same flash effect as a full waypoint capture, since the
     // user pressed the same conceptual "snapshot" button.
@@ -1781,42 +1796,68 @@ export class Engine {
 
     setupScene() {
         this.scene = new THREE.Scene();
-        this.scene.fog = new THREE.FogExp2(0x040410, 0.001);
+        // Fog removed — was previously fixed at 0.001 density which made
+        // distant particles fade dark/monochrome at zoom-out, fighting the
+        // ability to view systems from a distance. The opt-in slider was
+        // also removed because the foggy aesthetic conflicts with the
+        // "look at the real shape of this thing" core value of the app.
         this.setupReferenceGrid();
     }
 
-    // Reference sphere grid — a wireframe sphere centered on the origin
-    // that provides spatial orientation. Opacity is driven by
-    // window.S.referenceGrid (0..1, default 0). The mesh is always in
-    // the scene but invisible until the slider is raised.
+    // Reference sphere grid — a wireframe sphere that provides spatial
+    // orientation. Opacity is driven by window.S.referenceGrid (0..1,
+    // default 0). The mesh is always in the scene but invisible until the
+    // slider is raised. Behaves as a skybox: positioned at the camera each
+    // frame so it always reads as "the distant horizon" rather than a
+    // physical object in the world. Large radius ensures it lives far
+    // beyond any plausible particle extent.
     setupReferenceGrid() {
-        const radius = 100;
-        const widthSegs = 24;
-        const heightSegs = 16;
+        const radius = 5000;
+        const widthSegs = 32;
+        const heightSegs = 24;
         const geo = new THREE.SphereGeometry(radius, widthSegs, heightSegs);
-        const wf = new THREE.WireframeGeometry(geo);
-        const mat = new THREE.LineBasicMaterial({
-            color: 0x50dcff,
+        // Use WebGPU-compatible MeshBasicNodeMaterial with wireframe=true.
+        // The earlier LineBasicMaterial + LineSegments combo doesn't render
+        // under the WebGPU renderer used by this app — it silently failed
+        // (no error, no pixels). MeshBasicNodeMaterial is what every other
+        // material in the codebase uses, so it's guaranteed to work.
+        const mat = new THREE.MeshBasicNodeMaterial({
+            color: 0xffffff,
+            wireframe: true,
             transparent: true,
             opacity: 0,
-            depthWrite: false
+            depthWrite: false,
+            side: THREE.BackSide  // we're inside the sphere; render the inside faces
         });
-        this.refGrid = new THREE.LineSegments(wf, mat);
+        this.refGrid = new THREE.Mesh(geo, mat);
         this.refGrid.frustumCulled = false;
+        // Render before everything else (skybox-style). Particles will draw
+        // on top of it regardless of their position relative to the sphere
+        // surface, which is what we want for a backdrop.
+        this.refGrid.renderOrder = -1000;
         this.scene.add(this.refGrid);
     }
 
     updateReferenceGrid() {
         if (!this.refGrid) return;
         const v = (window.S && typeof window.S.referenceGrid === 'number') ? window.S.referenceGrid : 0;
-        // Multiplied by 0.4 so even at slider=1 it remains a reference,
-        // not a dominant visual element. 0.4 alpha is the max.
-        this.refGrid.material.opacity = v * 0.4;
-        this.refGrid.visible = v > 0.001;
-        // Theme-aware color — cornflower in classic, amber in synthesist.
-        const theme = window.S?.theme || 'classic';
-        const color = (theme === 'synthesist') ? 0xffaa55 : 0x50dcff;
-        this.refGrid.material.color.setHex(color);
+        // Slider range is now [0, 0.25] (the useful range — anything beyond
+        // overwhelms the simulation). Map directly to material opacity so
+        // slider=0.25 reads at 0.25 alpha. No multiplier needed.
+        this.refGrid.material.opacity = v;
+        // Hide the grid entirely when a screenshot capture is in progress.
+        // Grid is a visual aid, not part of the simulation's visual identity.
+        this.refGrid.visible = v > 0.001 && !window._captureInProgress;
+        // Skybox behavior: anchor the grid to the camera's position each
+        // frame so it never gets closer or farther as the camera orbits.
+        if (this.refGrid.visible && this.camera) {
+            this.refGrid.position.copy(this.camera.position);
+        }
+        // White in both themes — earlier theme-aware coloring (cyan/amber)
+        // read as yellow under low alpha because the white-additive
+        // blending against a dark canvas pulled the hue toward warm. Pure
+        // white renders correctly across all blending paths.
+        this.refGrid.material.color.setHex(0xffffff);
     }
 
     setupCamera() {
@@ -1854,7 +1895,21 @@ export class Engine {
                 const c = JSON.parse(savedCam);
                 if (c.pos) this.cam.pos.fromArray(c.pos);
                 if (c.quat) this.cam.quat.fromArray(c.quat);
-                if (c.dist !== undefined) { this.cam.dist = c.dist; this.cam.distTarget = c.dist; }
+                if (c.dist !== undefined) {
+                    // Only intervene on genuinely broken values (NaN, infinity,
+                    // negative, or zero). Otherwise preserve exactly what the
+                    // user had — they may have zoomed out deliberately to view
+                    // large emergent structures. The previous 500-unit clamp
+                    // was too aggressive: users zooming out to inspect
+                    // wide-scale emergence would have their position silently
+                    // reset on every reload, breaking continuity of their work.
+                    let d = c.dist;
+                    if (!Number.isFinite(d) || d <= 0) {
+                        d = 52;  // fall back to the default tight orbit
+                    }
+                    this.cam.dist = d;
+                    this.cam.distTarget = d;
+                }
                 if (c.yaw !== undefined) this.cam.yaw = c.yaw;
                 if (c.pitch !== undefined) this.cam.pitch = c.pitch;
                 if (c.flyMoveSpeed !== undefined) this.cam.flyMoveSpeed = c.flyMoveSpeed;
@@ -2163,7 +2218,18 @@ export class Engine {
                 });
 
                 vNode.assign(vec4(newV, life));
-                pNode.assign(vec4(newP, float(1.0)));
+                // Preserve per-particle size variation in pos.w. Previously
+                // this was clobbered to 1.0 every frame, which made every
+                // particle render at the same size (the random spawn-time
+                // variation in [0.5, 2.0] was being overwritten the moment
+                // physics ran). Now pos.w is carried through unchanged.
+                // Side effect: Size color mode now actually works — particles
+                // have different per-particle w values, so the spectrum maps
+                // them to distinct colors. On respawn the spawn cycle should
+                // re-randomize, which would require sampling a new value
+                // here, but for now using the existing value gives stable
+                // size identity per particle across its lifetime.
+                pNode.assign(vec4(newP, pNode.w));
             });
         });
 
@@ -2220,7 +2286,14 @@ export class Engine {
         const viewPos = modelViewMatrix.mul(vec4(worldPos, 1.0)).xyz;
 
         const colorMode = this.uniforms.colorMode;
-        const colorRange = this.uniforms.colorRange;
+        // Perceptual gamma curve on color spectrum range: linear colorRange
+        // produced a slider whose lower half felt "dead" because the spectral
+        // function is itself non-linear in input (lower phases occupy a
+        // narrow blue→purple band while upper phases sweep through the
+        // visually-distinct yellow/orange/red region). Square-rooting the
+        // input compresses the upper region and expands the lower one so
+        // the slider feels more responsive across its full travel.
+        const colorRange = sqrt(this.uniforms.colorRange);
         const velFromBuf = storage(this.velStorage, 'vec4', this.particleCount).element(instanceIndex);
 
         const getCellIndex = Fn(([cx, cy, cz]) => {
@@ -2272,21 +2345,56 @@ export class Engine {
 
         const spectrumWidth = add(mul(colorRange, float(1.2)), float(0.05));
         
-        const sizeVal = clamp(div(finalSize, mul(spectrumWidth, float(5.0))), 0.0, 1.0);
-        const velVal = clamp(div(speed, mul(spectrumWidth, float(15.0))), 0.0, 1.0);
-        const dynamicMax = max(float(this.MAX_PER_CELL), mul(float(this.uniforms.activeParticleCount), float(0.0005)));
-        const densityVal = clamp(mul(div(float(density), dynamicMax), spectrumWidth), 0.0, 1.0);
+        // Size mode reads the per-particle size factor (posFromBuf.w)
+        // directly rather than the post-multiplied finalSize. This isolates
+        // the actual per-particle size variation from the global pointSize
+        // uniform, so size differences become visible regardless of where
+        // the user has the pointSize slider. Particles are spawned with
+        // w in [0.5, 2.0], so we first normalize to [0, 1] before applying
+        // the colorRange. Previously the math mapped this range into the
+        // middle of the spectrum (~0.22 → 0.89), leaving the cool blues
+        // and hot reds unreachable. Normalizing first guarantees the full
+        // spectrum is accessible whenever colorRange is high enough.
+        const sizeNorm = clamp(div(sub(posFromBuf.w, float(0.5)), float(1.5)), 0.0, 1.0);
+        const sizeVal = clamp(mul(sizeNorm, spectrumWidth), 0.0, 1.0);
+        // Velocity mode uses sqrt compression so the full spectrum maps
+        // across the typical particle-velocity range. Without this, in any
+        // settled system most particles cluster around the same magnitude
+        // and previously mapped to one solid color in the blue end. Sqrt
+        // expands the low end and compresses the high end so the spectrum
+        // becomes sensitive to differences across the working range.
+        const velVal = clamp(div(sqrt(speed), mul(spectrumWidth, float(5.0))), 0.0, 1.0);
+        // Density mode had an inverted relationship with spectrumWidth
+        // compared to size/velocity (multiplied instead of divided), which
+        // squashed typical density values into the low-blue end and made
+        // density nearly impossible to read visually. Switched to the
+        // size/velocity pattern with a scaling factor calibrated against
+        // the spatial-hash cell capacity (32) so typical mid-cluster
+        // densities of 4-8 land in mid-spectrum.
+        const densityVal = clamp(div(float(density), mul(spectrumWidth, float(12.0))), 0.0, 1.0);
         
         const sizeColor = spectralColor(sizeVal);
         const velColor = spectralColor(velVal);
         const densityColor = spectralColor(densityVal);
         const baseColor = specCore(colorRange);
         
+        // Mono mode (0) is pure white — independent of the colorRange/hue
+        // slider so the saturation knob is the only thing that affects it.
+        // Prior behavior had Mono drift through the spectrum as colorRange
+        // changed, which contradicted the "mono = neutral" expectation.
         const baseModeColor = select(colorMode.equal(1), sizeColor, 
                             select(colorMode.equal(2), velColor,
-                                select(colorMode.equal(3), densityColor, baseColor)));
+                                select(colorMode.equal(3), densityColor, vec3(1.0))));
 
-        const finalColor = mix(vec3(1.0), baseModeColor, this.uniforms.sat);
+        // Perceptual gamma curve on saturation: human color response to
+        // white-mixing is non-linear. Raw linear mix produces a slider
+        // where the lower 60% all looks "desaturated" and color only
+        // really blooms in the top 25%. Square-rooting the slider value
+        // (gamma 2.0) reshapes the response so saturation feels even
+        // across the full travel — 50% slider produces a perceptibly
+        // half-saturated result instead of an almost-white one.
+        const satPerceptual = sqrt(this.uniforms.sat);
+        const finalColor = mix(vec3(1.0), baseModeColor, satPerceptual);
 
         const uPos = uv().sub(0.5);
         const distCirc = length(uPos);
@@ -2381,7 +2489,12 @@ export class Engine {
 
                 const toCam = normalize(sub(U.camPos, pos));
                 const norm = normalize(cross(validTan, toCam));
-                const hw = mul(U.pointSize, 0.5);
+                // Trail half-width: thinner than particles, with a sqrt
+                // remap so growth against resolution is gentle in the
+                // upper range. Previously `pointSize * 0.5` made trails
+                // outgrow particles fast as resolution increased; the new
+                // formula keeps them visually subordinate to the cloud.
+                const hw = mul(sqrt(U.pointSize), 0.25);
 
                 const outIdx = mul(tId, uint(2));
                 outPos.element(outIdx).assign(vec4(add(pos, mul(norm, hw)), 1.0));
@@ -2394,18 +2507,29 @@ export class Engine {
                 const dist = length(sub(p2, p1));
                 const distFade = clamp(sub(1.0, div(sub(dist, 60.0), 40.0)), 0.0, 1.0);
                 const baseFade = select(U.halfLife.lessThan(29.5), clamp(mul(life, 4.0), 0.0, 1.0), 1.0);
-                const fadeAlpha = mul(baseFade, distFade);
+                // Cap trail alpha at 10% of the system opacity slider.
+                // Previously the trails inherited 1:1 from system opacity,
+                // which made them blow out to pure white even at slider=0.05.
+                // The 0.1 ceiling means the full slider range now scales
+                // from invisible up to "what 0.1 used to look like" — a
+                // gradient that actually fits the system's natural use.
+                const fadeAlpha = mul(mul(baseFade, distFade), mul(U.pointOpacity, float(0.1)));
 
                 const speed1 = length(vBuf.element(i1).xyz);
                 const speed2 = length(vBuf.element(i2).xyz);
                 const speed = mix(speed1, speed2, u);
                 
-                const sw = add(mul(U.colorRange, 1.2), 0.05);
-                const velVal = clamp(div(speed, mul(sw, 15.0)), 0.0, 1.0);
-                const baseColor = specCore(U.colorRange);
+                const sw = add(mul(sqrt(U.colorRange), 1.2), 0.05);
+                // Sqrt compression — matches main particle material for
+                // consistency between trails and their parent particles.
+                const velVal = clamp(div(sqrt(speed), mul(sw, 5.0)), 0.0, 1.0);
+                const baseColor = specCore(sqrt(U.colorRange));
+                // Mono mode (0) → pure white. Matches the main particle
+                // material's Mono behavior so trails/ribbons don't drift
+                // through the spectrum when the rest of the cloud is white.
                 const modeColor = select(U.colorMode.equal(2), spectralColor(velVal),
-                    select(U.colorMode.equal(1), spectralColor(0.5), baseColor));
-                const fc = vec4(mix(vec3(1.0), modeColor, U.sat), fadeAlpha);
+                    select(U.colorMode.equal(1), spectralColor(0.5), vec3(1.0)));
+                const fc = vec4(mix(vec3(1.0), modeColor, sqrt(U.sat)), fadeAlpha);
 
                 outCol.element(outIdx).assign(fc);
                 outCol.element(add(outIdx, uint(1))).assign(fc);
@@ -2445,7 +2569,10 @@ export class Engine {
                 const pos = pBuf.element(i).xyz;
                 const tangent = normalize(sub(pBuf.element(i2).xyz, pBuf.element(i0).xyz));
                 const norm = normalize(cross(tangent, normalize(sub(U.camPos, pos))));
-                const hw = mul(U.pointSize, 0.5);
+                // Trail half-width: thinner than particles, sqrt remap on
+                // resolution so growth against the resolution slider is
+                // gentle in the upper range. Matches the ribbon material.
+                const hw = mul(sqrt(U.pointSize), 0.25);
                 // Trail length scalar — extends segment along tangent so
                 // the slider visibly affects the lattice (not just ribbons).
                 const segScale = mul(U.trailLen, 0.1);
@@ -2457,16 +2584,24 @@ export class Engine {
                 const dist = length(sub(pBuf.element(i2).xyz, pos));
                 const distFade = clamp(sub(1.0, div(sub(dist, 60.0), 40.0)), 0.0, 1.0);
                 const baseFade = select(U.halfLife.lessThan(29.5), clamp(mul(life, 4.0), 0.0, 1.0), 1.0);
-                const fadeAlpha = mul(baseFade, distFade);
+                // Cap lattice alpha at 10% of the system opacity slider.
+                // Matches the ribbon material — prevents blow-out at low
+                // opacity slider values; full slider range maps to
+                // "previously 0 → 0.1" effective alpha.
+                const fadeAlpha = mul(mul(baseFade, distFade), mul(U.pointOpacity, float(0.1)));
 
                 const vel = vBuf.element(i).xyz;
                 const speed = length(vel);
-                const sw = add(mul(U.colorRange, 1.2), 0.05);
-                const velVal = clamp(div(speed, mul(sw, 15.0)), 0.0, 1.0);
-                const baseColor = specCore(U.colorRange);
+                const sw = add(mul(sqrt(U.colorRange), 1.2), 0.05);
+                // Sqrt compression — matches main material.
+                const velVal = clamp(div(sqrt(speed), mul(sw, 5.0)), 0.0, 1.0);
+                const baseColor = specCore(sqrt(U.colorRange));
+                // Mono mode → white for the lattice too. Keeps the lattice
+                // visually consistent with the particle cloud when Mono is
+                // active.
                 const modeColor = select(U.colorMode.equal(2), spectralColor(velVal),
-                    select(U.colorMode.equal(1), spectralColor(0.5), baseColor));
-                const fc = vec4(mix(vec3(1.0), modeColor, U.sat), fadeAlpha);
+                    select(U.colorMode.equal(1), spectralColor(0.5), vec3(1.0)));
+                const fc = vec4(mix(vec3(1.0), modeColor, sqrt(U.sat)), fadeAlpha);
                 outCol.element(mul(i, uint(2))).assign(fc);
                 outCol.element(add(mul(i, uint(2)), uint(1))).assign(fc);
             });
@@ -2562,15 +2697,43 @@ export class Engine {
                 if (wOrS) {
                     const delta = e.deltaY > 0 ? -0.1 : 0.1;
                     cam.orbitZoomSpeed = Math.max(0.1, Math.min(10, cam.orbitZoomSpeed + delta));
+                    // Reveal + sync the orbit speed popup and toast the value.
+                    if (window.refreshSpeedPopups) window.refreshSpeedPopups('orbit');
+                    if (window.showParamToast) window.showParamToast('Zoom Speed', cam.orbitZoomSpeed.toFixed(1));
                 } else {
                     const zoomFactor = 1.0 + (e.deltaY > 0 ? 0.08 : -0.08);
                     // Uncapped zoom-out — see orbit keyboard handler above.
                     // Floor kept at 1; ceiling removed.
                     cam.distTarget = Math.max(1, cam.distTarget * zoomFactor);
+                    if (window.showParamToast) window.showParamToast('Zoom', Math.round(cam.distTarget).toString());
                 }
             } else {
-                const delta = e.deltaY > 0 ? -0.1 : 0.1;
-                cam.flyMoveSpeed = Math.max(0.05, Math.min(20, cam.flyMoveSpeed + delta));
+                // Fly mode scroll:
+                //   • default: FOV zoom (inverse — scroll up = zoom in =
+                //     lower FOV). Mirrors the Causmonaut behavior the user
+                //     likes — gives fly mode a sense of optical depth
+                //     without changing position. Rate is tied to fly speed
+                //     so users who've slowed down get fine FOV control and
+                //     fast flyers get coarse adjustments.
+                //   • W or S held: adjusts fly speed, matching the
+                //     "modifier + scroll = adjust the speed slider"
+                //     pattern that orbit mode uses.
+                const wOrS = (this._keys && (this._keys['KeyW'] || this._keys['KeyS']));
+                if (wOrS) {
+                    const delta = e.deltaY > 0 ? -0.1 : 0.1;
+                    cam.flyMoveSpeed = Math.max(0.05, Math.min(20, cam.flyMoveSpeed + delta));
+                    // Reveal + sync the fly speed popup and toast the value.
+                    if (window.refreshSpeedPopups) window.refreshSpeedPopups('fly');
+                    if (window.showParamToast) window.showParamToast('Fly Speed', cam.flyMoveSpeed.toFixed(2));
+                } else {
+                    // FOV zoom. Bounded to a sane range: 10° (heavy zoom)
+                    // to 120° (wide fish-eye). Default is 60°.
+                    const zoomRate = 1.0 + cam.flyMoveSpeed * 0.4;  // higher fly speed → bigger FOV steps
+                    const delta = (e.deltaY > 0 ? 1 : -1) * zoomRate;
+                    this.camera.fov = Math.max(10, Math.min(120, this.camera.fov + delta));
+                    this.camera.updateProjectionMatrix();
+                    if (window.showParamToast) window.showParamToast('FOV', Math.round(this.camera.fov) + '°');
+                }
             }
         }, { passive: true });
         canvas.addEventListener('contextmenu', e => e.preventDefault());
@@ -2716,35 +2879,78 @@ export class Engine {
 
         if (this.bgCanvas && v('bgGlow') > 0) {
             const mode = S.colorMode || 0;
-            const hRaw = v('hue') || 0.5;
+            const colorRange = v('hue') || 0.5; // misleadingly named — this is the spectral index
             const sVal = Math.round((v('sat') ?? 0.8) * 100);
-            const h = Math.round(hRaw * 360);
-            // Backdrop colors are anchored NEAR the particles' base hue with
-            // small ±30° offsets per mode. Previous logic computed `spread`
-            // from hRaw itself, which meant blue hues produced 260° spreads
-            // and put RED on the screen even when particles were blue. The
-            // backdrop should sample from the particle palette, not invent
-            // its own wide gradient.
+
+            // Compute a representative particle color by sampling the
+            // SAME spectral function the shader uses (specCore). This is
+            // the JS port of the GPU function — must stay in sync with
+            // any changes to specCore() above.
+            //
+            // The shader uses colorRange as an INDEX into the spectrum
+            // (specCore(colorRange) gives one specific color). Particles
+            // are then state-driven offsets around that center index.
+            // The bg should sample around the same center to look like
+            // it belongs with the particles.
+            const specCoreJS = (eBase) => {
+                const e = ((eBase % 1) + 1) % 1; // safe mod for negatives
+                const r = Math.min(1, Math.max(0, e < 0.5 ? e * 0.4 : 0.2 + (e - 0.5) * 1.6));
+                const g = Math.min(1, Math.max(0,
+                    e < 0.3 ? 0.1
+                    : e < 0.7 ? (e - 0.3) * 1.5
+                    : 0.6 - (e - 0.7) * 1.5));
+                const b = Math.min(1, Math.max(0,
+                    e < 0.5 ? 0.9 - e * 0.8 : 0.5 - (e - 0.5) * 1.0));
+                return { r, g, b };
+            };
+            const rgbToHsl = (r, g, b) => {
+                const max = Math.max(r, g, b), min = Math.min(r, g, b);
+                const l = (max + min) / 2;
+                let h = 0, s = 0;
+                if (max !== min) {
+                    const d = max - min;
+                    s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+                    switch (max) {
+                        case r: h = (g - b) / d + (g < b ? 6 : 0); break;
+                        case g: h = (b - r) / d + 2; break;
+                        case b: h = (r - g) / d + 4; break;
+                    }
+                    h *= 60;
+                }
+                return { h: Math.round(h), s: Math.round(s * 100), l: Math.round(l * 100) };
+            };
+
             let gradientStr = '';
             if (mode === 0) {
-                const h2 = (h + 20) % 360;
-                gradientStr = `radial-gradient(ellipse at center, hsl(${h},${sVal}%,16%) 0%, hsl(${h2},${sVal}%,8%) 50%, transparent 80%)`;
-            } else if (mode === 1) {
-                // Rainbow particles — keep the backdrop in a tight band
-                // around the base hue instead of fanning across the wheel
-                const h2 = (h + 15) % 360;
-                const h3 = (h + 30) % 360;
-                gradientStr = `radial-gradient(ellipse at center, hsl(${h2},${sVal}%,18%) 0%, hsl(${h3},${sVal}%,10%) 45%, hsl(${h},${sVal}%,5%) 70%, transparent 90%)`;
-            } else if (mode === 2) {
-                // Gradient particles — small symmetric offset, not spread
-                const hLow  = (h - 20 + 360) % 360;
-                const hHigh = (h + 20) % 360;
-                gradientStr = `radial-gradient(ellipse at center, hsl(${hHigh},${sVal}%,18%) 0%, hsl(${h},${sVal}%,9%) 35%, hsl(${hLow},${sVal}%,4%) 75%, transparent 90%)`;
-            } else if (mode === 3) {
-                // Solid-mode core gets a complementary tint, but keep the
-                // outer falloff at the base hue so the eye stays grounded.
-                const hCore = (h + 30) % 360;
-                gradientStr = `radial-gradient(ellipse at center, hsl(${hCore},${sVal}%,22%) 0%, hsl(${h},${sVal}%,12%) 30%, hsl(${h},${sVal}%,5%) 60%, transparent 85%)`;
+                // Mono — particles are pure white. Bg is neutral dark gray
+                // (no hue tint). Was previously tinted slightly blue which
+                // gave Mono mode a cool cast that didn't match the
+                // expectation of "white particles → black background."
+                gradientStr = `radial-gradient(ellipse at center, rgba(35,35,35,0.5) 0%, rgba(15,15,15,0.4) 50%, transparent 80%)`;
+            } else {
+                // Modes 1-3: sample the spectral palette AROUND the
+                // colorRange center index, with a tight band of ±0.08
+                // for the visible particles' typical color spread. This
+                // makes the bg sit in the same color neighborhood as the
+                // particles. Previously the samples were multiplied by
+                // colorRange instead of offset from it, which collapsed
+                // every sample into the blue end of the spectrum
+                // regardless of where particles were actually rendering.
+                const center = colorRange;
+                const samplePoints = [center - 0.08, center, center + 0.08];
+                const colors = samplePoints.map(p => {
+                    const rgb = specCoreJS(p);
+                    const hsl = rgbToHsl(rgb.r, rgb.g, rgb.b);
+                    return hsl;
+                });
+                // Build a 3-stop gradient: bright sample in middle, mid
+                // sample at 50%, dark sample at outer.
+                gradientStr =
+                    `radial-gradient(ellipse at center, ` +
+                    `hsl(${colors[2].h},${sVal}%,18%) 0%, ` +
+                    `hsl(${colors[1].h},${sVal}%,9%) 45%, ` +
+                    `hsl(${colors[0].h},${sVal}%,4%) 75%, ` +
+                    `transparent 90%)`;
             }
             this.bgCanvas.style.background = gradientStr;
             this.bgCanvas.style.opacity = Math.min(1, v('bgGlow') * 1.5).toFixed(2);
@@ -2907,15 +3113,15 @@ export function initRadialUI() {
       { key: 'showRibbons', label: 'Strings', type: 'toggle' },
       { key: 'tessRibbons', label: 'Lattice', type: 'toggle' }, null,
       { key: 'trailLen', label: 'Trail Length', min: 3, max: 30, step: 1, sensitivity: 0.15, format: value => Math.round(value).toString() }, null, 
-      { key: 'sat', label: 'Color Saturation', min: 0, max: 1, step: 0.01, sensitivity: 0.005, format: value => value.toFixed(2) },
-      { key: 'colorMode', label: 'Color Mode', type: 'enum', options: [0, 1, 2, 3], labels: ['Base', 'Size', 'Velocity', 'Density'], sensitivity: 0.02 },
+      { key: 'sat', label: 'Color Saturation', min: 0, max: 1.5, step: 0.01, sensitivity: 0.005, format: value => value.toFixed(2) },
+      { key: 'colorMode', label: 'Color Mode', type: 'enum', options: [0, 1, 2, 3], labels: ['Mono', 'Size', 'Velocity', 'Density'], sensitivity: 0.02 },
       { key: 'hue', label: 'Color Spectrum Range', min: 0, max: 1, step: 0.01, sensitivity: 0.005, format: value => value.toFixed(2) },
       { key: 'newWaypoint', label: 'New Waypoint', type: 'trigger', action: () => window.captureWaypoint() },
       { key: 'startTour', label: 'Start Tour', type: 'trigger', action: () => { 
           if(window.tour && window.tour.active) { if(window.stopTour) window.stopTour(); }
           else { if(window.startTour) window.startTour(); }
       } },
-      { key: 'opacity', label: 'Particle Opacity', min: 0, max: 1, step: 0.01, sensitivity: 0.005, format: value => value.toFixed(2) },
+      { key: 'opacity', label: 'System Opacity', min: 0, max: 1, step: 0.01, sensitivity: 0.005, format: value => value.toFixed(2) },
       { key: 'showParticles', label: 'Quanta', type: 'toggle' }
     ];
 
@@ -2924,7 +3130,7 @@ export function initRadialUI() {
       { key: 'buttonShape', label: 'Button Shape', type: 'enum', options: ['hex', 'circle'], labels: ['Hex', 'Circle'], sensitivity: 0.02 },
       { key: 'uiScanlines', label: 'UI Scanlines', min: 0, max: 0.5, step: 0.01, sensitivity: 0.003, format: value => value.toFixed(2) },
       { key: 'bgGlow', label: 'Backdrop', min: 0, max: 0.8, step: 0.02, sensitivity: 0.005, format: value => value.toFixed(2) },
-      { key: 'bgBlur', label: 'Backdrop Blur', min: 0, max: 100, step: 1, sensitivity: 0.4, format: value => Math.round(value).toString() }, null, 
+      { key: 'bgBlur', label: 'Backdrop Blur', min: 0, max: 300, step: 1, sensitivity: 0.4, format: value => Math.round(value).toString() }, null, 
       { key: 'uiZoom', label: 'UI Zoom', min: 0.5, max: 1.5, step: 0.05, sensitivity: 0.006, format: value => value.toFixed(2) },
       { key: 'screenScanlines', label: 'Screen Scan', min: 0, max: 0.5, step: 0.01, sensitivity: 0.003, format: value => value.toFixed(2) },
       { key: 'resetLayout', label: 'Reset Layout', type: 'trigger', action: function() { 
@@ -3148,6 +3354,22 @@ export function initRadialUI() {
             
             if (window.engine) window.engine.updateUniforms();
             this.updateActiveNode(control); 
+
+            // Live readout toast — same as the slider's. Resolves the
+            // displayed value differently for enum vs numeric controls
+            // because enums show their label string, not a number.
+            if (window.showParamToast) {
+                let displayVal;
+                if (control.type === 'enum') {
+                    const idx = control.options.indexOf(window.S[control.key]);
+                    displayVal = idx >= 0 ? control.labels[idx] : String(window.S[control.key]);
+                } else if (control.type === 'toggle') {
+                    displayVal = window.S[control.key] ? 'on' : 'off';
+                } else {
+                    displayVal = formatParamValue(window.S[control.key]);
+                }
+                window.showParamToast(control.label || control.key, displayVal);
+            }
 
             // Side-effect hooks for keys that need follow-up beyond just updating window.S. Theme/shape changes need apply functions.
             try {
@@ -4087,16 +4309,24 @@ export function setupUI(engine) {
         const vw = window.innerWidth / zoom;
         const vh = window.innerHeight / zoom;
         document.querySelectorAll('.panel').forEach(p => {
+            if (p.classList.contains('hidden')) return;  // skip closed panels
             let left = parseFloat(p.style.left) || 0;
             let top  = parseFloat(p.style.top)  || 0;
             const pw = p.offsetWidth;
             const ph = p.offsetHeight;
-            // Keep at least the panel header (28px) on screen
-            const minVisible = 28;
+            // Keep at least 80px of the panel visible so users can find
+            // and grab it. Previously was 28px which was a thin sliver
+            // that was easy to miss after a fullscreen toggle or resize.
+            const minVisible = 80;
             if (left < 0) left = 0;
             if (top  < 0) top  = 0;
             if (left + minVisible > vw) left = vw - minVisible;
             if (top  + minVisible > vh) top  = vh - minVisible;
+            // Also pull fully off-screen panels back to a safe position.
+            // If the panel is so far off it's not visible at all, drop it
+            // at (0, 0) instead of leaving it stranded.
+            if (left + pw < minVisible) left = 0;
+            if (top + ph < minVisible) top = 0;
             p.style.left = left + 'px';
             p.style.top  = top  + 'px';
         });
@@ -4174,6 +4404,11 @@ export function setupUI(engine) {
                         }
                     }
                 }
+                // After loading saved positions, verify all panels are
+                // still on-screen via the existing clampPanels (also called
+                // on resize/fullscreen). Window may have been resized
+                // between sessions, or this may be a different monitor.
+                clampPanels();
             } else {
                 // First run — no saved positions. Place each panel just above
                 // the dock so users see a clear cause/effect when they click
@@ -4376,6 +4611,11 @@ export function setupUI(engine) {
     if (window.renderDock) window.renderDock(); // Sync dock buttons with loaded panel states
     initDrag();
     window.addEventListener('resize', clampPanels);
+    // Fullscreen toggle (F11) may not always fire 'resize' synchronously
+    // on every browser. Listen for fullscreenchange explicitly so panels
+    // re-clamp to the viewport the moment the screen dimensions change.
+    document.addEventListener('fullscreenchange', clampPanels);
+    document.addEventListener('webkitfullscreenchange', clampPanels);
     
     // Initialize Radial Menu Paradigm
     initRadialUI();
@@ -4451,6 +4691,15 @@ function initDock() {
             valEl.textContent = v.toFixed(2);
         });
         popup.appendChild(inp);
+        // Expose a sync so external value changes (e.g. W/S + scroll-wheel
+        // adjusting speed via the canvas wheel handler) can refresh the
+        // slider thumb and numeric readout. Without this the popup only
+        // updated on its own input event and went stale after a scroll.
+        popup._sync = () => {
+            const cur = getCurrent();
+            inp.value = cur;
+            valEl.textContent = cur.toFixed(2);
+        };
         return popup;
     };
 
@@ -4474,25 +4723,44 @@ function initDock() {
     navOrbit.appendChild(orbitSpeedPopup);
     navFly.appendChild(flySpeedPopup);
 
+    // Lets the canvas wheel handler refresh these popups when W/S + scroll
+    // changes orbitZoomSpeed / flyMoveSpeed directly on the cam object,
+    // keeping the slider thumb and readout in sync with the live value.
+    // Pass 'orbit' or 'fly' to also flash that popup visible so the user
+    // sees the change happen even when not hovering the button.
+    window.refreshSpeedPopups = (flashMode) => {
+        try { orbitSpeedPopup._sync(); } catch (e) {}
+        try { flySpeedPopup._sync(); } catch (e) {}
+        try {
+            if (flashMode === 'orbit' && orbitSpeedPopup._flash) orbitSpeedPopup._flash();
+            else if (flashMode === 'fly' && flySpeedPopup._flash) flySpeedPopup._flash();
+        } catch (e) {}
+    };
+
     // Show/hide logic. Sub-millisecond function; called on every
     // pointerenter/pointerleave on the button + popup.
     const wireSpeedPopup = (btn, popup, requiredMode) => {
         let hideTimer = null;
         const show = () => {
-            if (window.S.moveMode !== requiredMode) return;
             clearTimeout(hideTimer);
             popup.classList.add('visible');
         };
-        const hideSoon = () => {
+        const hideSoon = (delay = 400) => {
             clearTimeout(hideTimer);
             // 400ms grace lets the user transit from button to popup
             // without the popup disappearing en route.
-            hideTimer = setTimeout(() => popup.classList.remove('visible'), 400);
+            hideTimer = setTimeout(() => popup.classList.remove('visible'), delay);
         };
-        btn.addEventListener('pointerenter', show);
-        btn.addEventListener('pointerleave', hideSoon);
+        // Hover reveal is mode-gated (don't show the fly popup while orbiting).
+        btn.addEventListener('pointerenter', () => { if (window.S.moveMode === requiredMode) show(); });
+        btn.addEventListener('pointerleave', () => hideSoon());
         popup.addEventListener('pointerenter', () => { clearTimeout(hideTimer); });
-        popup.addEventListener('pointerleave', hideSoon);
+        popup.addEventListener('pointerleave', () => hideSoon());
+        // Flash the popup visible when W/S + scroll changes the speed, so the
+        // user can see the thumb and value move. Longer hide grace than hover
+        // (1100ms) so the change is readable before it fades. Only fired for
+        // the active mode — the wheel handler is already inside that branch.
+        popup._flash = () => { show(); hideSoon(1100); };
     };
     wireSpeedPopup(navOrbit, orbitSpeedPopup, 'orbit');
     wireSpeedPopup(navFly, flySpeedPopup, 'fly');
@@ -4519,6 +4787,14 @@ function initDock() {
     const setNavMode = (mode) => {
         if (window.S.moveMode === mode) return;
         window.S.moveMode = mode;
+        // Reset camera FOV back to default when leaving fly mode so any
+        // zoom-in from fly's scroll-wheel doesn't bleed into orbit. Orbit
+        // uses position-distance for zoom, not FOV — having a stale lens
+        // setting from a previous fly session would feel like a bug.
+        if (mode === 'orbit' && window.engine && window.engine.camera) {
+            window.engine.camera.fov = 60;
+            window.engine.camera.updateProjectionMatrix();
+        }
         syncNavToggle();
         // Match makeGroupToggles semantics: any explicit mode change cancels
         // an active tour (the user is now driving), refreshes radial UI, and
@@ -4692,8 +4968,32 @@ function initLogo() {
     // Re-apply docked position on resize or dock movement.
     const onLayoutChange = () => {
         if (logo.classList.contains('docked')) applyDocked();
+        // Also clamp the free (un-docked) logo to the viewport so it can't
+        // end up off-screen after a fullscreen toggle or window resize.
+        // If undocked and now partially off-screen, drag it back in.
+        if (!logo.classList.contains('docked')) {
+            const r = logo.getBoundingClientRect();
+            const vw = window.innerWidth;
+            const vh = window.innerHeight;
+            const margin = 8; // keep at least 8px on-screen on every side
+            let needsUpdate = false;
+            let newLeft = r.left, newTop = r.top;
+            if (r.right > vw - margin) { newLeft = vw - r.width - margin; needsUpdate = true; }
+            if (r.left < margin)        { newLeft = margin; needsUpdate = true; }
+            if (r.bottom > vh - margin) { newTop = vh - r.height - margin; needsUpdate = true; }
+            if (r.top < margin)         { newTop = margin; needsUpdate = true; }
+            if (needsUpdate) {
+                logo.style.left = newLeft + 'px';
+                logo.style.top = newTop + 'px';
+            }
+        }
     };
     window.addEventListener('resize', onLayoutChange);
+    // Fullscreen toggle (F11) doesn't always fire 'resize' synchronously
+    // on every browser — listen for fullscreenchange explicitly so the
+    // logo re-anchors itself to the dock the moment the viewport shifts.
+    document.addEventListener('fullscreenchange', onLayoutChange);
+    document.addEventListener('webkitfullscreenchange', onLayoutChange);
 
     // Snap-back on pointerup if dropped near the dock-relative target.
     document.addEventListener('pointerup', () => {
@@ -4735,15 +5035,12 @@ function initLogo() {
         }
     });
 
-    // Mouse-distance fade — 25% opacity when cursor > 150px from center.
-    const FADE_RADIUS = 150;
-    document.addEventListener('pointermove', (e) => {
-        const r = logo.getBoundingClientRect();
-        const cx = r.left + r.width / 2;
-        const cy = r.top + r.height / 2;
-        const dist = Math.hypot(e.clientX - cx, e.clientY - cy);
-        logo.classList.toggle('distant', dist > FADE_RADIUS);
-    });
+    // Mouse-distance fade removed. Previously the logo dimmed to 25%
+    // opacity when the cursor was far from it, and the fade radius was
+    // small enough that moving the mouse for normal navigation would
+    // trigger the dim state — making the logo feel unstable. Now it
+    // sits at a single steady opacity. Click-to-toggle and drag still
+    // work; only the involuntary distance-based fade is gone.
 
     // Click toggles 'opaque' (hides with UI on Tab) ↔ 'translucent' (persists
     // through Tab as ambient UI). Drag distinguished by 4px movement threshold.
@@ -4767,6 +5064,62 @@ function initLogo() {
 }
 window.initLogo = initLogo;
 
+// Keys that should never go negative — even in Unbound mode. These are
+// parameters where negative values are either physically meaningless,
+// would crash the engine, or cause buffer-allocation failures. The
+// Unbound feature is meant to expose interesting out-of-range behavior
+// (like negative inversion producing galactic spirals); these keys are
+// excluded because negative values produce only broken states, not
+// interesting ones. They CAN still exceed their max (uncapped on top).
+//   tempo      — negative tempo would run physics backwards. Tempting
+//                in theory but the integrator isn't reversible; produces
+//                degenerate states, not time-reversal.
+//   freeEnergy — sizes a GPU buffer. Negative crashes immediately.
+//   resolution — particle billboard size. Negative breaks rendering.
+const UNBOUND_NON_NEGATIVE_KEYS = new Set(['tempo', 'freeEnergy', 'resolution']);
+
+// Keys that ignore Unbound entirely — always clamped to slider range.
+// Two groups belong here:
+//   • UI-chrome controls (background appearance, sky grid, etc) where
+//     out-of-range values either do nothing or just look wrong.
+//   • Normalized optical knobs whose range IS the meaningful domain:
+//     opacity / buttonOpacity (alpha, 0..1 is the whole space — there's
+//     no "more than fully opaque"), hue (a 0..1 spectral index that just
+//     wraps past the ends), and sat (saturation; past max is already
+//     full color). Letting these escape only produces confusing numbers,
+//     not new behavior — so they stay bound even in Unbound mode and
+//     therefore never show the broken-chain indicator.
+const UNBOUND_ALWAYS_CLAMPED_KEYS = new Set([
+    'referenceGrid', 'bgGlow', 'bgBlur', 'uiScanlines', 'screenScanlines',
+    'uiZoom', 'panelOpacity',
+    'opacity', 'buttonOpacity', 'hue', 'sat'
+]);
+
+// Combined gating used by both drag-scrub and typed-entry commit paths.
+// Bounded mode: clamp to declared slider [min, max].
+// Unbound mode: pass through verbatim, except keys in UNBOUND_NON_NEGATIVE_KEYS
+// (floored at 0) and UNBOUND_ALWAYS_CLAMPED_KEYS (still range-clamped).
+function clampForBoundlessMode(key, val, min, max) {
+    if (!window.S.boundless) {
+        return Math.max(min, Math.min(max, val));
+    }
+    if (UNBOUND_ALWAYS_CLAMPED_KEYS.has(key)) {
+        return Math.max(min, Math.min(max, val));
+    }
+    if (UNBOUND_NON_NEGATIVE_KEYS.has(key) && val < 0) {
+        return 0;
+    }
+    return val;
+}
+
+// Reflect Unbound mode as a body class so CSS can reveal the broken-chain
+// indicator on every unboundable slider at once. Called from the
+// Bound/Unbound toggle and once on UI build to pick up persisted state.
+function applyBoundlessClass() {
+    document.body.classList.toggle('boundless', !!window.S.boundless);
+}
+window.applyBoundlessClass = applyBoundlessClass;
+
 function makeSlider(p, label, subhead, ll, lr, key, min, max, step, cb) {
     // Cache range so the modulation pipeline can compute proper amplitude and clamp values back into bounds.
     window._paramRanges = window._paramRanges || {};
@@ -4787,6 +5140,11 @@ function makeSlider(p, label, subhead, ll, lr, key, min, max, step, cb) {
     const d = document.createElement('div');
     d.className = 'row';
     d.dataset.paramKey = key;  // used by the modulation indicator (CSS pulse)
+    // Flag rows whose value can escape its slider range in Unbound mode, so
+    // CSS can show a ghosted broken-chain glyph next to the value (gated on
+    // body.boundless) — making it obvious WHICH sliders actually unbind.
+    // Chrome/appearance keys stay clamped even in Unbound, so no flag.
+    if (!UNBOUND_ALWAYS_CLAMPED_KEYS.has(key)) d.dataset.unboundable = '1';
     if ((window.S[key + '_mod'] || 0) > 0.001) d.dataset.modulating = 'true';
     const fmtVal = (v) => v < 1 && v > 0 ? v.toFixed(3) : v < 100 ? Number(v).toFixed(1) : Math.round(v);
 
@@ -4820,6 +5178,14 @@ function makeSlider(p, label, subhead, ll, lr, key, min, max, step, cb) {
     const updateVal = (val, isProgrammatic = false) => {
         window.S[key] = parseFloat(val);
         sliderSync[key](window.S[key]);
+        // Live readout toast: shows "Label: value" in the center-anchor
+        // toast position so users can see the value as they scrub without
+        // looking away from the simulation. Programmatic changes (state
+        // restore, waypoint travel) skip the toast since they aren't
+        // user-driven.
+        if (!isProgrammatic && window.showParamToast) {
+            window.showParamToast(label, formatParamValue(window.S[key]));
+        }
         // Tour only cancels on changes to params it animates.
         if (!isProgrammatic && window.tour && window.tour.active && TOUR_STOPPING_KEYS.has(key)) window.stopTour();
         if (window.refreshRadialUI) window.refreshRadialUI();
@@ -4885,8 +5251,13 @@ function makeSlider(p, label, subhead, ll, lr, key, min, max, step, cb) {
             try { valSpan.setPointerCapture(_ptrStart.pointerId); _ptrStart.captured = true; } catch (err) {}
         }
         const newVal = _ptrStart.startVal + dx * DRAG_PER_PX;
-        // Uncapped — bar pins via sliderSync clamp.
-        updateVal(newVal, false);
+        // Boundless mode (window.S.boundless) lets drag-scrub push past
+        // the slider range; bounded mode (default) clamps to [min, max]
+        // so users can't accidentally crank a value into a regime that
+        // crashes the engine. A small set of keys are floored at 0 even
+        // in unbound mode — see NON_NEGATIVE_KEYS for the reasoning.
+        const clamped = clampForBoundlessMode(key, newVal, _min, _max);
+        updateVal(clamped, false);
     };
 
     const onPointerUp = (e) => {
@@ -4927,7 +5298,12 @@ function makeSlider(p, label, subhead, ll, lr, key, min, max, step, cb) {
         const raw = valSpan.textContent.trim();
         const parsed = Number(raw);
         if (Number.isFinite(parsed)) {
-            updateVal(parsed, false);
+            // Same boundless gating as drag-scrub — typed values get
+            // clamped to slider range in bounded mode (default), allowed
+            // through verbatim in boundless mode (except for a small set
+            // of keys floored at 0 — see clampForBoundlessMode).
+            const finalVal = clampForBoundlessMode(key, parsed, _min, _max);
+            updateVal(finalVal, false);
         } else {
             // Unparseable → restore the pre-edit displayed value without
             // changing state.
@@ -5344,9 +5720,9 @@ export function buildUI(engine) {
             if (window.travelToHomepoint) window.travelToHomepoint();
         }
     });
-    if (!window.S.homepoint) {
-        homepointBtn.style.animation = 'pulseGreen 1.5s infinite';
-    }
+    // Bottom Homepoint button no longer glows when unset — the glow on the top
+    // +Homepoint button is the canonical "set one here" affordance. Two
+    // simultaneously-glowing buttons confused users about which one to click.
     // Re-initialize: blows away particle state, restarts at same coords.
     // Reveals the true attractor without stigmergic momentum.
     makeBtn(rd, 'Re-initialize', '#5fa8c8', () => {
@@ -5358,15 +5734,17 @@ export function buildUI(engine) {
     Array.from(rd.children).forEach(styleBottomBtn);
 
     // ─── Optics ───────────────────────────────────────────────────────────
-    // Order: Particle Opacity → Quanta → Trails → Trail Length →
+    // Order: System Opacity → Quanta → Trails → Trail Length →
     // Color Mode → Color Spectrum Range → Color Saturation.
     // Backdrop sliders live in Config → UI (they affect the UI layer, not
     // the simulation). Dependent controls (Trail Length) live-update via
     // _toggleUpdaters; no buildUI rebuilds on toggle.
     const sb = document.getElementById('settingsBody'); sb.innerHTML = '';
 
-    // Particle Opacity — first, simplest knob.
-    makeSlider(sb, c.opacity?.label || 'Particle Opacity', c.opacity?.sub ||'', c.opacity?.ll ||'ghost', c.opacity?.lr ||'solid', 'opacity', 0, 1, .05);
+    // System Opacity — first, simplest knob. Was named "Particle Opacity"
+    // but it actually controls particles + trails + lattice (everything
+    // the system renders), so "System Opacity" is more honest about scope.
+    makeSlider(sb, c.opacity?.label || 'System Opacity', c.opacity?.sub ||'', c.opacity?.ll ||'ghost', c.opacity?.lr ||'solid', 'opacity', 0, 1, .01);
 
     const quantaT = T.quanta || { label: 'Quanta', items: ['Circle', 'Square', 'Diamond'] };
     makeSection(sb, 'quanta');
@@ -5386,8 +5764,9 @@ export function buildUI(engine) {
     ]);
 
     // Trail Length: standard slider, disabled when both trail types are off.
+    // No custom margin-top — the slider's own margin and the makeButtonRow's
+    // margin-bottom provide consistent spacing matching other sections.
     const trailWrap = document.createElement('div');
-    trailWrap.style.cssText = 'margin-top:10px;';
     sb.appendChild(trailWrap);
     makeSlider(
         trailWrap,
@@ -5409,7 +5788,7 @@ export function buildUI(engine) {
     });
     updateTrailEnabled();
 
-    const cmm = T.colorMode || { label: 'Color Mode', items: ['White', 'Size', 'Velocity', 'Density'] };
+    const cmm = T.colorMode || { label: 'Color Mode', items: ['Mono', 'Size', 'Velocity', 'Density'] };
     makeSection(sb, 'colorMode');
     makeGroupToggles(sb, [
         { label: cmm.items[0], key: 'colorMode', matchVal: 0 },
@@ -5422,7 +5801,7 @@ export function buildUI(engine) {
     makeSlider(sb, c.colorRange?.label || 'Color Spectrum Range', c.colorRange?.sub ||'', c.colorRange?.ll ||'tight', c.colorRange?.lr ||'wide', 'hue', 0.01, 1, 0.01, () => {
         if (window.engine) window.engine.updateUniforms();
     });
-    makeSlider(sb, c.saturation?.label || 'Color Saturation', c.saturation?.sub ||'', c.saturation?.ll ||'muted', c.saturation?.lr ||'vivid', 'sat', 0, 1.0, 0.01, () => {
+    makeSlider(sb, c.saturation?.label || 'Color Saturation', c.saturation?.sub ||'', c.saturation?.ll ||'muted', c.saturation?.lr ||'vivid', 'sat', 0, 1.5, 0.01, () => {
         if (window.engine) window.engine.updateUniforms();
     });
 
@@ -5703,7 +6082,7 @@ export function buildUI(engine) {
         const _bgOpD = makeSlider(uiPane, c.backdropOpacity?.label || 'Backdrop Opacity', c.backdropOpacity?.sub ||'', c.backdropOpacity?.ll ||'off', c.backdropOpacity?.lr ||'bright', 'bgGlow', 0, .8, .02);
         if (_bgCanvasUI && _bgOpD) {
             _bgOpD.querySelector('input').addEventListener('input', () => { _bgCanvasUI.style.opacity = window.S.bgGlow; });
-            const _bgBlD = makeSlider(uiPane, c.backdropBlur?.label || 'Backdrop Blur', c.backdropBlur?.sub ||'', c.backdropBlur?.ll ||'crisp', c.backdropBlur?.lr ||'soft', 'bgBlur', 0, 100, 1);
+            const _bgBlD = makeSlider(uiPane, c.backdropBlur?.label || 'Backdrop Blur', c.backdropBlur?.sub ||'', c.backdropBlur?.ll ||'crisp', c.backdropBlur?.lr ||'soft', 'bgBlur', 0, 300, 1);
             if (_bgBlD) _bgBlD.querySelector('input').addEventListener('input', () => { _bgCanvasUI.style.filter = 'blur(' + window.S.bgBlur + 'px)'; });
         }
         makeSlider(uiPane, 'UI Zoom', '', '50%', '150%', 'uiZoom', 0.5, 1.5, .05, (val) => {
@@ -5715,8 +6094,15 @@ export function buildUI(engine) {
 
         // Reference Grid — wireframe sphere around the simulation that gives
         // spatial bearings. Off by default; raising the slider fades it in.
-        makeSlider(uiPane, 'Reference Grid', '', 'off', 'visible', 'referenceGrid', 0, 1, 0.02);
+        makeSlider(uiPane, 'Sky Grid', '', 'off', 'visible', 'referenceGrid', 0, 0.25, 0.005);
 
+        // ─── Numeric Bounds ──────────────────────────────────────────────
+        // Default Bound: slider values clamp to declared min/max. Unbound
+        // mode lets typed entry / drag-scrub push past the slider range
+        // for power users who want to explore out-of-range behavior. The
+        // subhead names what the toggles bind so the affordance is clear
+        // — critical UX info that a comment can't substitute for. Shorter
+        // phrasing chosen to fit inline-right in the narrow cfg-pane.
         makeSection(uiPane, 'Radial Button Shape');
         makeGroupToggles(uiPane, [
             { label: 'Hex',    key: 'buttonShape', matchVal: 'hex',    cb: () => { applyButtonShape(); } },
@@ -5753,6 +6139,19 @@ export function buildUI(engine) {
             window._toggleUpdaters[k].add(updateInclEnabled);
         });
         updateInclEnabled();
+
+        // ─── Numeric Bounds ──────────────────────────────────────────────
+        // Default Bound: slider values clamp to declared min/max. Unbound
+        // mode lets typed entry / drag-scrub push past the slider range
+        // for power users who want to explore out-of-range behavior. Lives
+        // in System rather than UI because it's a behavior toggle (how the
+        // controls behave) rather than an appearance setting.
+        makeSection(systemPane, 'Numeric Bounds', 'binds to slider ranges');
+        makeGroupToggles(systemPane, [
+            { label: 'Bound',   key: 'boundless', matchVal: false, cb: applyBoundlessClass },
+            { label: 'Unbound', key: 'boundless', matchVal: true,  cb: applyBoundlessClass }
+        ]);
+        applyBoundlessClass(); // reflect persisted Unbound state on UI build
 
     }
 
@@ -5924,17 +6323,27 @@ window.S = {
     uiScanlines: 0.06,       // 0..0.5 opacity of CRT scanlines over panels
     screenScanlines: 0.06,   // 0..0.5 opacity of CRT scanlines over the simulation canvas
     buttonShape: 'hex',      // 'hex' | 'circle'  (radial menu button shape)
-    referenceGrid: 0,        // 0..1 opacity of background reference sphere grid
+    referenceGrid: 0,        // 0..0.25 opacity of background sky grid
     // Screenshot save triggers, split per gesture so users can opt into one
     // or both flows. Old saveScreenshots key is migrated at load time.
-    saveOnNewWaypoint: false,
-    saveOnNewThumbnail: false,
-    includeScreenshotBg: false, // when true, screenshot includes the dark backdrop; when false, transparent
-    includeScreenshotScanlines: false, // when true, screenshot bakes in the CRT scanline overlay
+    // Defaulted ON because waypoint captures are how users build their
+    // personal atlas — they should get a usable artifact by default
+    // without having to opt in. Users who don't want the downloads can
+    // turn these off in the System pane.
+    saveOnNewWaypoint: true,
+    saveOnNewThumbnail: true,
+    includeScreenshotBg: true,        // background visible in screenshots
+    includeScreenshotScanlines: true, // CRT scanlines baked into screenshots
     
     // ─── Audio ─────────────────────────────────────────────────────────────
     audioOn: false,
     volume: 0.5,
+
+    // When false (default), typed values and drag-scrub are clamped to each
+    // slider's declared min/max. When true, out-of-range values pass through
+    // and the slider bar pins at 0/100% visually. Boundless mode is the
+    // power-user behavior — bounded mode is what new users expect.
+    boundless: false,
     
     // Base attributes manually mapped outside APP_CONFIG
     offsetX: 0,
@@ -6503,18 +6912,78 @@ function applyButtonShape() {
 
 // ─── Tiny toast helper ─────────────────────────────────────────────────────
 // Feedback on changes that happen "off-screen" (such as config changes that affect things the user can't currently see).
+//   msg         — text to show
+//   opts.color  — accent color (border + text). Defaults to theme accent.
+//   opts.duration — total visible time in ms. Defaults to 2000.
+//                   Longer durations are useful for one-shot warnings
+//                   (seizure warning is 5000) where the user needs time
+//                   to read and decide whether to continue.
 function showToast(msg, opts = {}) {
     const d = document.createElement('div');
     const accent = opts.color || (window.S.theme === 'synthesist' ? '#ffaa55' : '#50dcff');
+    const duration = opts.duration || 2000;
     // Anchored at ~1/3 from the bottom — toasts at the top were getting lost
     // against the dock UI and hud text. This position floats over the open
     // canvas area so the message is in the user's natural focal zone.
-    d.style.cssText = 'position:fixed;bottom:33vh;left:50%;transform:translateX(-50%);background:rgba(10,10,24,0.88);border:1px solid ' + accent + ';color:' + accent + ';padding:7px 14px;border-radius:4px;font-size:11px;font-weight:bold;z-index:1000;pointer-events:none;animation:fadeN 2s forwards;letter-spacing:0.06em;text-transform:uppercase;';
+    // The CSS animation `fadeN` runs over 2s by default; for longer-duration
+    // toasts we override the animation-duration inline so the fade-out
+    // happens at the end of the requested duration instead of at 2s.
+    d.style.cssText = 'position:fixed;bottom:33vh;left:50%;transform:translateX(-50%);background:rgba(10,10,24,0.88);border:1px solid ' + accent + ';color:' + accent + ';padding:7px 14px;border-radius:4px;font-size:11px;font-weight:bold;z-index:1000;pointer-events:none;animation:fadeN ' + (duration / 1000) + 's forwards;letter-spacing:0.06em;text-transform:uppercase;';
     d.textContent = msg;
     document.body.appendChild(d);
-    setTimeout(() => d.remove(), 2000);
+    setTimeout(() => d.remove(), duration);
 }
 window.showToast = showToast;
+
+// ─── Live parameter readout toast ─────────────────────────────────────────
+// As the user scrubs a slider or rotates a radial, this shows the parameter
+// being changed and its current value in the standard toast position. The
+// user can keep their eyes on the simulation in the center of the screen
+// instead of looking down at the slider to read the numeric value.
+//
+// Single sticky element (reused across calls, not recreated each tick) to
+// avoid DOM churn during continuous scrub gestures. Auto-fades after a
+// short idle period; resets the fade timer on every call so as long as
+// the user is actively changing something it stays up.
+//
+// Borrowed from Causmonaut — same pattern, same purpose.
+const _paramToastState = { el: null, fadeTimer: null };
+function showParamToast(label, value) {
+    let el = _paramToastState.el;
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'paramToast';
+        document.body.appendChild(el);
+        _paramToastState.el = el;
+    }
+    const accent = window.S.theme === 'synthesist' ? '#ffaa55' : '#50dcff';
+    el.style.cssText = 'position:fixed;bottom:33vh;left:50%;transform:translateX(-50%);background:rgba(10,10,24,0.88);border:1px solid ' + accent + ';color:' + accent + ';padding:7px 14px;border-radius:4px;font-size:11px;font-weight:bold;z-index:1000;pointer-events:none;letter-spacing:0.06em;text-transform:uppercase;opacity:1;transition:opacity 250ms ease;';
+    el.textContent = label + ': ' + value;
+    if (_paramToastState.fadeTimer) clearTimeout(_paramToastState.fadeTimer);
+    // Idle fade — 800ms after the last change, dim then remove. Keeps the
+    // toast up during continuous scrubs but gets out of the way after.
+    _paramToastState.fadeTimer = setTimeout(() => {
+        if (el) {
+            el.style.opacity = '0';
+            setTimeout(() => {
+                if (el && el.parentNode) el.parentNode.removeChild(el);
+                _paramToastState.el = null;
+                _paramToastState.fadeTimer = null;
+            }, 280);
+        }
+    }, 800);
+}
+window.showParamToast = showParamToast;
+
+// Format helper — same logic as the slider's display formatter so the
+// toast value matches what users see on the slider readout.
+function formatParamValue(v) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) return String(v);
+    if (v > 0 && v < 0.01) return v.toFixed(6);
+    if (v < 1 && v > -1) return v.toFixed(3);
+    if (Math.abs(v) < 100) return v.toFixed(1);
+    return Math.round(v).toString();
+}
 
 // ─── ASCII Boot Splash ─────────────────────────────────────────────────────
 
@@ -6529,11 +6998,61 @@ function showBootSplash() {
     overlay.style.cssText = [
         'position:fixed', 'inset:0',
         'pointer-events:auto', 'z-index:200',
-        'cursor:pointer',
-        'display:flex', 'align-items:center', 'justify-content:center',
-        'flex-direction:column'
+        'cursor:default',  // default during loading; switches to pointer once interactive
+        'background:#000',  // solid black under the loading state so the ASCII jerk is hidden
+        // Suppress browser text-selection highlight during boot. Without this,
+        // holding a key down (or dragging on touch) painted a system blue
+        // selection rectangle over the ASCII as the user-agent treated the
+        // <pre> as selectable text.
+        'user-select:none', '-webkit-user-select:none'
     ].join(';');
     document.body.appendChild(overlay);
+
+    // ─── Loading state ──────────────────────────────────────────────────────
+    // Shows immediately on page load while the engine initializes. The
+    // engine init (WebGPU device acquisition, shader compilation, buffer
+    // allocation) can take 200-800ms of bursty main-thread work that would
+    // otherwise stutter the ASCII type-in animation. By showing a simple
+    // static text first, all the jerkiness happens behind a static curtain.
+    // Absolute-positioned so it doesn't share flex layout with the ASCII
+    // container — they overlap at center and crossfade independently.
+    const loadingEl = document.createElement('div');
+    loadingEl.id = 'boot-loading';
+    loadingEl.style.cssText = [
+        'position:absolute',
+        'top:50%', 'left:50%',
+        'transform:translate(-50%, -50%)',
+        'color:rgba(255,255,255,0.7)',
+        'font-family:monospace, "Courier New", "JetBrains Mono"',
+        'font-size:11px', 'letter-spacing:0.3em', 'text-transform:uppercase',
+        'opacity:0', 'transition:opacity 400ms ease',
+        'text-shadow:0 0 8px rgba(255,255,255,0.3)',
+        'pointer-events:none'
+    ].join(';');
+    loadingEl.textContent = 'loading…';
+    overlay.appendChild(loadingEl);
+    // Fade in next frame so the transition runs.
+    requestAnimationFrame(() => { loadingEl.style.opacity = '1'; });
+
+    // ─── ASCII container ────────────────────────────────────────────────────
+    // ASCII art + "press any key" prompt sit inside a flex column so the
+    // prompt naturally sits below the art. The container is absolute-
+    // positioned and centered so it doesn't share layout with the loading
+    // text. Starts at opacity:0 so it's invisible but still measurable
+    // (display:inline-flex keeps it part of the layout — using display:none
+    // here would zero out offsetWidth/offsetHeight, which previously broke
+    // the dimension lock and caused the ASCII to wrap badly post-crossfade).
+    const asciiContainer = document.createElement('div');
+    asciiContainer.id = 'boot-ascii-container';
+    asciiContainer.style.cssText = [
+        'position:absolute',
+        'top:50%', 'left:50%',
+        'transform:translate(-50%, -50%)',
+        'display:flex', 'flex-direction:column', 'align-items:center',
+        'opacity:0', 'transition:opacity 500ms ease',
+        'pointer-events:none'
+    ].join(';');
+    overlay.appendChild(asciiContainer);
 
     const el = document.createElement('pre');
     el.id = 'boot-splash';
@@ -6545,13 +7064,16 @@ function showBootSplash() {
     el.style.cssText = [
         'color:#fff', 'font-family:monospace, "Courier New", "JetBrains Mono"',
         'font-size:11px', 'line-height:1.15', 'white-space:pre',
-        'text-align:left', 'opacity:1', 'transition:opacity 1.5s ease',
+        'text-align:left',
         'text-shadow:0 0 8px rgba(255,255,255,0.4)', 'margin:0', 'padding:0',
-        'display:inline-block',
-        'pointer-events:none' // clicks pass through to the overlay
+        'display:inline-block'
     ].join(';');
     el.textContent = art;
-    overlay.appendChild(el);
+    asciiContainer.appendChild(el);
+    // Measure NOW while element is rendered with full text. With the
+    // container at opacity:0 the box still occupies layout space, so
+    // offsetWidth/offsetHeight report real values. Lock these so the
+    // element stays the same size as the typer fills it in.
     const w = el.offsetWidth;
     const h = el.offsetHeight;
     el.style.width = w + 'px';
@@ -6571,7 +7093,7 @@ function showBootSplash() {
         'text-shadow:0 0 8px rgba(255,255,255,0.3)'
     ].join(';');
     prompt.textContent = '▸ press any key to begin';
-    overlay.appendChild(prompt);
+    asciiContainer.appendChild(prompt);
 
     const lines = art.split('\n');
     let i = 0;
@@ -6595,12 +7117,16 @@ function showBootSplash() {
                 [{ opacity: 1 }, { opacity: 0.35 }, { opacity: 1 }],
                 { duration: 1800, iterations: Infinity, easing: 'ease-in-out' }
             );
+            // Now that the splash is ready for user interaction, switch the
+            // overlay cursor to a pointer to signal "click to begin."
+            overlay.style.cursor = 'pointer';
         }
     };
     // NOTE: typer() is NOT called here. Caller invokes the returned
-    // `startTyping` function once heavy init (setupUI, Engine) is complete,
-    // so the typer's setTimeouts don't sit blocked in the queue while the
-    // main thread is busy — which produced the line-batching stutter.
+    // `startTyping` function once heavy init (setupUI, Engine, renderer
+    // init) is complete, so the typer's setTimeouts don't sit blocked in
+    // the queue while the main thread is busy — which produced the
+    // line-batching stutter.
 
     let pulseAnim = null;
     let dismissed = false;
@@ -6615,6 +7141,18 @@ function showBootSplash() {
         // time the splash is gone, panels are fully visible (0.4s transition),
         // so the handoff is seamless.
         if (window.setUIVisibility) window.setUIVisibility(true);
+        // Photosensitivity advisory — shown once on entry using the same
+        // toast system as everything else. Amber accent so it reads as
+        // caution rather than info. 5s duration gives enough time to read.
+        // Previously this used a bespoke #strobeWarning element with its
+        // own CSS keyframes — replaced with showToast so all advisories
+        // share one positioning + animation system.
+        if (window.showToast) {
+            window.showToast('⚠ Caution: Flashing Visuals', {
+                color: '#c0a070',
+                duration: 5000
+            });
+        }
         if (pulseAnim) { try { pulseAnim.cancel(); } catch (e) {} }
         prompt.style.opacity = '0';
         // Reveal art line-by-line from the top — opposite of how it typed in.
@@ -6635,7 +7173,9 @@ function showBootSplash() {
                 el.textContent = padding.concat(remaining).join('\n');
                 setTimeout(eraser, dismissCadence);
             } else {
-                el.style.opacity = '0';
+                // Fade the whole container — both ASCII and prompt go
+                // away together. Container has the opacity transition.
+                asciiContainer.style.opacity = '0';
                 overlay.style.pointerEvents = 'none'; // release click capture immediately
                 setTimeout(() => { overlay.remove(); }, 600);
             }
@@ -6652,7 +7192,24 @@ function showBootSplash() {
     // animation until heavy synchronous init has settled. See init() flow
     // for why this matters (stutter / line-batching).
     return () => {
-        if (i === 0) typer();
+        if (i !== 0) return;
+        // Crossfade: fade out the loading text and fade in the ASCII
+        // container simultaneously. Both are absolute-positioned at center,
+        // so they overlap during the transition. Once the loading curtain
+        // is gone, drop the overlay's black background so the canvas
+        // (now rendering its first frame behind us) becomes visible
+        // through the ASCII as it types in.
+        loadingEl.style.opacity = '0';
+        asciiContainer.style.opacity = '1';
+        // Start the typer immediately — by the time the first few lines
+        // appear, the crossfade has progressed enough for them to be
+        // visible. Don't wait for the crossfade to fully complete.
+        requestAnimationFrame(() => { typer(); });
+        // Drop background after crossfade completes (matches loading
+        // transition duration of 400ms + a hair).
+        setTimeout(() => {
+            overlay.style.background = 'transparent';
+        }, 450);
     };
 }
 
@@ -7262,13 +7819,10 @@ function init() {
     return;
   }
 
-  // Engine is up — kick off the splash typing now. Defer one rAF so the
-  // engine's first frame schedules before the typer starts taking time
-  // slices, which makes the visual start of typing feel synchronized with
-  // "everything is ready behind the scenes."
-  requestAnimationFrame(() => {
-    if (startSplashTyping) startSplashTyping();
-  });
+  // Splash typing now starts on first frame inside startEngine() — see
+  // _firstFrameDrawn block below. This guarantees the canvas is showing
+  // live content before the type-in begins, hiding any init jerk behind
+  // the static "loading…" curtain.
 
   // Key handlers for global actions (Ctrl+S for waypoints)
   let lastTempo = null;
@@ -7325,6 +7879,14 @@ function init() {
 
       if (e.code === 'Pause') {
           e.preventDefault();
+          // If a tour is running, the Pause key stops it. Users expect a
+          // pause control to halt motion regardless of source — a tour
+          // that auto-warps between waypoints is a strong source of motion,
+          // and not stopping it left the user staring at a "paused" tempo
+          // while the camera kept flying through waypoints.
+          if (window.tour && window.tour.active && window.stopTour) {
+              window.stopTour();
+          }
           if (window.S.tempo === 0) {
               window.S.tempo = lastTempo !== null ? lastTempo : 0.02;
               lastTempo = null;
@@ -7386,7 +7948,15 @@ function init() {
       // this, the canvas fades from blank-to-blank then pops in.
       if (!_firstFrameDrawn) {
           _firstFrameDrawn = true;
-          requestAnimationFrame(() => document.body.classList.add('engine-ready'));
+          requestAnimationFrame(() => {
+              document.body.classList.add('engine-ready');
+              // Engine has drawn its first frame — main thread is now free
+              // for the boot splash ASCII typer. Crossfade loading → art.
+              // Doing this on first-frame rather than on init resolve makes
+              // sure the canvas itself is showing real content before we
+              // start the type-in, so the ASCII overlays a live system.
+              if (startSplashTyping) startSplashTyping();
+          });
       }
     }
 

@@ -1,6 +1,6 @@
 {
   "name": "scale-space-synth",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "description": "Scale Space Synthesist — a phase-space visualizer / higher-dimensional oscilloscope. WebGPU + TSL.",
   "type": "module",
   "private": true,

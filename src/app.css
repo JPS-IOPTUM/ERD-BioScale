@@ -180,20 +180,39 @@ body.ui-ready .panel:not(.hidden) {
 .section {
     display: flex;
     flex-direction: row;
-    align-items: baseline;
-    gap: 8px;
-    margin-top: 14px;
-    margin-bottom: 6px;
+    flex-wrap: wrap;
+    /* flex-start, not baseline — baseline alignment causes the head to
+     * shift its rendered position relative to the sub when the sub wraps
+     * to a new line, which produced the "text hangs into the panel margin"
+     * glitch in narrower panes. flex-start keeps both anchored to the
+     * left edge cleanly. */
+    align-items: flex-start;
+    column-gap: 8px;
+    row-gap: 2px;
+    margin-top: 16px;
+    margin-bottom: 4px;
 }
 .section .section-head {
     color: #d9edf6;
     font-size: 11px;
     letter-spacing: 0.04em;
+    /* Head never shrinks — keep the title intact. If the sub can't fit
+     * on the same line (narrower panes like .cfg-pane with longer subs),
+     * the sub wraps to a new row below, still left-aligned. Prevents the
+     * default flex behavior of making the two children share the row as
+     * pseudo-columns. */
+    flex: 0 0 auto;
 }
 .section .section-sub {
     color: #718a99;
     font-size: 8px;
-    /* No top margin — we're inline now, not stacked. */
+    /* When the row wraps, sub starts on its own line — width:100% pins
+     * it to the left edge instead of inheriting its inline width. The
+     * small top offset compensates for the smaller font landing higher
+     * within the flex line than the head, visually aligning the bottoms. */
+    flex: 0 1 auto;
+    align-self: flex-end;
+    padding-bottom: 1px;
 }
 /* First-of-pane sections don't need the top spacing — the panel-body
  * padding already provides it. */
@@ -206,7 +225,7 @@ body.ui-ready .panel:not(.hidden) {
  * both top-of-group and group-of-controls hierarchies cleanly.) */
 
 .slider-row {
-    margin-bottom: 10px
+    margin-bottom: 12px
 }
 
 .slider-labels {
@@ -296,6 +315,25 @@ body.ui-ready .panel:not(.hidden) {
     outline: 1px solid rgba(109, 255, 176, 0.5);
     /* Caret color matches the value text for consistency. */
     caret-color: #6dffb0;
+}
+
+/* ─── Unbound indicator ──────────────────────────────────────────────────
+ * A ghosted "broken chain" glyph sits just left of a slider's value to show
+ * the value can escape its slider range. Only appears while Unbound mode is
+ * active (body.boundless) and only on rows flagged data-unboundable in
+ * makeSlider — chrome/appearance sliders stay clamped, so they never get the
+ * mark. Purely informational; pointer-events:none so it can't intercept the
+ * click-to-edit / drag-scrub on the value. */
+body.boundless .row[data-unboundable="1"] .val::before {
+    content: '';
+    display: inline-block;
+    width: 11px;
+    height: 11px;
+    margin-right: 4px;
+    vertical-align: middle;
+    opacity: 0.5;
+    background: no-repeat center / contain url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9.5 8H7a4 4 0 0 0 0 8h2.5'/%3E%3Cpath d='M14.5 8H17a4 4 0 0 1 0 8h-2.5'/%3E%3Cline x1='5' y1='19' x2='19' y2='5'/%3E%3C/svg%3E");
+    pointer-events: none;
 }
 
 .bar { 
@@ -468,10 +506,9 @@ body[data-theme="synthesist"] .btn:hover {
 #hud-title:not(.docked)::after {
     opacity: 0;
 }
-/* Mouse-distance fade: when far from the logo, drop opacity. */
-#hud-title.distant {
-    opacity: 0.25;
-}
+/* Mouse-distance fade rule removed — the JS handler that added .distant
+ * was deleted because the dim-when-far behavior made the logo feel
+ * unstable during normal navigation. */
 
 #hud-title.hidden {
     opacity: 0 !important;
@@ -1537,10 +1574,10 @@ body[data-theme="synthesist"] .dock-btn[data-closed="false"]:hover {
 }
 /* Vertical range input. Custom appearance so the track and thumb match
  * the panel theme — the default browser styling was a black box with a
- * purple thumb on Chromium, which clashed badly with both themes. */
+ * purple thumb on Chromium, which clashed badly with both themes.
+ * Orientation is now controlled by writing-mode (slider-vertical was
+ * deprecated by Chrome in favor of the standardized CSS approach). */
 .dock-speed-range {
-    -webkit-appearance: slider-vertical;
-    appearance: slider-vertical;
     writing-mode: vertical-lr;
     direction: rtl;
     width: 6px;
@@ -1718,6 +1755,14 @@ body[data-theme="synthesist"] .dock-nav-seg[data-active="false"]:hover {
     border-top-right-radius: 4px;
     margin-bottom: -1px;
     transition: color 180ms ease, background 180ms ease, border-color 180ms ease;
+}
+/* Suppress the browser's default focus ring on cfg tabs. We don't support
+ * Tab-key keyboard navigation through the UI (the Tab key is bound to
+ * toggle UI visibility), so the focus outline here only appears as visual
+ * noise — never as a useful affordance. */
+.cfg-tab:focus,
+.cfg-tab:focus-visible {
+    outline: none;
 }
 .cfg-tab:hover {
     color: #cce6ff;
@@ -2092,7 +2137,7 @@ body[data-theme="synthesist"] .wp-discoby-name {
 .button-row {
     display: flex;
     gap: 4px;
-    margin: 4px 0;
+    margin: 0 0 12px 0;
     flex-wrap: wrap;
 }
 .button-row-btn {
@@ -2242,34 +2287,10 @@ body[data-theme="synthesist"] .controls-row-binding {
  * shouldn't see ambient overlays competing with the start screen. Once
  * triggered: 1s fade in, 3s hold, 1s fade out. Non-blocking via
  * pointer-events:none. */
-#strobeWarning {
-    position: fixed;
-    bottom: 90px;
-    left: 50%;
-    transform: translateX(-50%);
-    color: #c0a070;
-    font-size: 10px;
-    letter-spacing: 0.04em;
-    text-align: center;
-    background: rgba(8, 8, 16, 0.55);
-    border: 1px solid rgba(192, 160, 112, 0.35);
-    padding: 6px 14px;
-    border-radius: 3px;
-    max-width: 80vw;
-    pointer-events: none;
-    opacity: 0;
-    z-index: 9999;
-    /* No animation until ui-ready — the body class flip triggers it. */
-}
-body.ui-ready #strobeWarning {
-    animation: strobeWarningFade 5s ease forwards;
-}
-@keyframes strobeWarningFade {
-    0%   { opacity: 0; }
-    20%  { opacity: 1; }
-    80%  { opacity: 1; }
-    100% { opacity: 0; }
-}
+/* (Former #strobeWarning rules removed — the photosensitivity advisory
+ * now uses the global showToast system on splash dismiss. Keeping all
+ * one-shot advisories in a single positioning + animation system means
+ * future warnings only need a single line of JS to add.) */
 
 /* .btn-danger — destructive actions (Clear Waypoints, Clear All Data).
  * Same .btn base but with red border + text. Hover reverses to a more
